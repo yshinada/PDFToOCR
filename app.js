@@ -1,4 +1,5 @@
 import * as pdfjs from './pdf.mjs';
+import {prepareOcrImage, normalizeJapaneseSpacing, chooseRecognition} from './ocr-image.js?v=1';
 pdfjs.GlobalWorkerOptions.workerSrc = new URL('./pdf.worker.mjs', import.meta.url).href;
 const $ = id => document.getElementById(id);
 let busy = false, cancelled = false, worker = null, loadingTask = null, documentPdf = null, currentName = 'document', activePage = 0, pageCount = 0;
@@ -43,19 +44,37 @@ async function processPdf(file) {
    else {
     if (!worker) {
      progress('OCRモデルを準備しています…', (number - 1) / pageCount * 100, '初回は言語モデルのダウンロードに時間がかかります。');
-     const createdWorker = await Tesseract.createWorker($('language').value, 1, { cachePath: high ? 'yomito-best' : 'yomito-standard', ...(high ? {langPath:'https://tessdata.projectnaptha.com/4.0.0_best'} : {}), logger: message => { if (cancelled) return; if (message.status === 'recognizing text') progress(`${activePage} / ${pageCount} ページをOCR中`, ((activePage - 1 + message.progress) / pageCount) * 100, `${Math.round(message.progress * 100)}% · ${file.name}`); }, errorHandler: () => {} });
+     const createdWorker = await Tesseract.createWorker($('language').value, 1, { cachePath: high ? 'yomito-best-v2' : 'yomito-standard', ...(high ? {langPath:'https://raw.githubusercontent.com/tesseract-ocr/tessdata_best/e12c65a915945e4c28e237a9b52bc4a8f39a0cec',gzip:false} : {}), logger: message => { if (cancelled) return; if (message.status === 'recognizing text') progress(`${activePage} / ${pageCount} ページをOCR中`, ((activePage - 1 + message.progress) / pageCount) * 100, `${Math.round(message.progress * 100)}% · ${file.name}`); }, errorHandler: () => {} });
      if (cancelled) { await createdWorker.terminate(); break; } worker = createdWorker;
-     await worker.setParameters({preserve_interword_spaces:'1', tessedit_pageseg_mode: $('language').value.includes('vert') ? '5' : '3'});
+     await worker.setParameters({preserve_interword_spaces:'0', user_defined_dpi:'300', tessedit_pageseg_mode: $('language').value.includes('vert') ? '5' : '3'});
     }
-    const base = page.getViewport({scale:1}); const desired = high ? 3 : 2; const scale = Math.min(desired, 4096 / Math.max(base.width, base.height), Math.sqrt(16000000 / (base.width * base.height))); const viewport = page.getViewport({scale});
+    const base = page.getViewport({scale:1}); const desired = high ? 300 / 72 : 2; const scale = Math.min(desired, 4096 / Math.max(base.width, base.height), Math.sqrt(16000000 / (base.width * base.height))); const viewport = page.getViewport({scale});
     const canvas = document.createElement('canvas'); canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height);
     await page.render({canvasContext:canvas.getContext('2d'),viewport,background:'#ffffff'}).promise;
     if (cancelled) { canvas.width = canvas.height = 0; break; }
-    let recognized; try { recognized = await Promise.race([worker.recognize(canvas), new Promise((_, reject) => { cancelRecognition = reject; })]); } finally { cancelRecognition = null; } result = recognized.data.text.trim(); scanned++; canvas.width = canvas.height = 0;
+    const vertical = $('language').value.includes('vert');
+    const input = high ? prepareOcrImage(canvas, {vertical}) : canvas;
+    try {
+     await worker.setParameters({tessedit_pageseg_mode: vertical ? '5' : '3'});
+     let recognized = await recognizeImage(input, high && !vertical);
+     if (high && !vertical && recognized.confidence < 90 && !cancelled) {
+      progress(`${number} / ${pageCount} ページの読み取りを再確認中`, (number - 1) / pageCount * 100, '別のレイアウト設定で比較しています。');
+      await worker.setParameters({tessedit_pageseg_mode:'6'});
+      recognized = chooseRecognition(recognized, await recognizeImage(input, false));
+     }
+     result = ($('language').value.includes('jpn') ? normalizeJapaneseSpacing(recognized.text) : recognized.text).trim(); scanned++;
+    } finally { if(input!==canvas) input.width=input.height=0; canvas.width=canvas.height=0; }
    }
    parts.push(`--- ${number}ページ ---\n${result || '（文字を検出できませんでした）'}`); page.cleanup();
   }
   if (!cancelled) { $('text').value = parts.join('\n\n'); $('summary').textContent = `${pageCount}ページ · 直接抽出 ${direct}ページ / OCR ${scanned}ページ`; $('result').hidden = false; }
  } catch (error) { if (!cancelled && $('error').hidden) { const known = /100ページ/.test(error.message); showError(known ? error.message : 'PDFを読み取れませんでした。ファイルの破損・保護、通信状況を確認して再度お試しください。'); } }
  finally { if (worker) { await worker.terminate().catch(() => {}); worker = null; } if (documentPdf) await documentPdf.destroy().catch(() => {}); documentPdf = null; loadingTask = null; $('progress').hidden = true; controls(false); if (cancelled) showError('読み取りを中止しました。別のPDFを追加できます。'); }
+}
+
+async function recognizeImage(canvas, rotateAuto) {
+ try {
+  const response = await Promise.race([worker.recognize(canvas, {rotateAuto}), new Promise((_, reject) => {cancelRecognition=reject;})]);
+  return response.data;
+ } finally {cancelRecognition=null;}
 }
